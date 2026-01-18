@@ -16,7 +16,7 @@ class KnowledgeController extends Controller
     // 说明：前端变量 {{apple_idX}} {{apple_pwX}} {{apple_statusX}} {{apple_timeX}} （X 从 0 开始）
     // 参考文档：https://appleauto.pro/docs/api/v2board.html
     // 这里填写你的 AppleAutoPro shareapi 地址（如果分享页有密码也在该地址中体现；若没有请留空）
-    private $share_url = 'https://xx.xx.xx/shareapi/gVQvljbXiw/xxx';
+    private $share_url = 'https://xx.xx.xx/shareapi/sss/xxx';
 
     public function fetch(Request $request)
     {
