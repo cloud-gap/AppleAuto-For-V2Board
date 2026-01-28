@@ -16,7 +16,7 @@ class KnowledgeController extends Controller
     // 说明：前端变量 {{apple_idX}} {{apple_pwX}} {{apple_statusX}} {{apple_timeX}} （X 从 0 开始）
     // 参考文档：https://appleauto.pro/docs/api/v2board.html
     // 这里填写你的 AppleAutoPro shareapi 地址（如果分享页有密码也在该地址中体现；若没有请留空）
-    private $share_url = 'https://xx.xx.xx/shareapi/sss/xxx';
+    private $share_url = 'https://test.com/shareapi/kfcv50';
 
     public function fetch(Request $request)
     {
@@ -97,50 +97,123 @@ class KnowledgeController extends Controller
         // 未配置 share_url 时，不处理
         if (!$this->share_url) return;
 
+        // 统一的错误清理：避免页面上残留 {{apple_xx}} 占位符
+        $clearPlaceholders = function () use (&$body) {
+            $body = preg_replace('/\{\{apple_(id|pw|status|time)\d+\}\}/', '', $body);
+        };
+
         try {
-            $stream_opts = [
-                'ssl' => [
-                    'verify_peer' => false,
-                    'verify_peer_name' => false,
-                ],
-                'http' => [
-                    'timeout' => 5,
-                    'header' => [
+            $result = null;
+
+            // 优先使用 cURL（对 403/重定向/UA 更友好）
+            if (function_exists('curl_init')) {
+                $ch = curl_init();
+                curl_setopt_array($ch, [
+                    CURLOPT_URL => $this->share_url,
+                    CURLOPT_RETURNTRANSFER => true,
+                    CURLOPT_FOLLOWLOCATION => true,
+                    CURLOPT_MAXREDIRS => 5,
+                    CURLOPT_TIMEOUT => 8,
+                    CURLOPT_CONNECTTIMEOUT => 5,
+                    CURLOPT_SSL_VERIFYPEER => false,
+                    CURLOPT_SSL_VERIFYHOST => false,
+                    CURLOPT_HTTPHEADER => [
+                        'Accept: application/json, text/plain, */*',
                         'Content-Type: application/json',
-                        'Accept: application/json, text/plain, */*'
-                    ]
-                ]
-            ];
+                        'User-Agent: CloudGap/1.0 (V2Board; AppleAutoPro)',
+                    ],
+                ]);
+                $result = curl_exec($ch);
+                $httpCode = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                $curlErr = curl_error($ch);
+                curl_close($ch);
 
-            $result = file_get_contents($this->share_url, false, stream_context_create($stream_opts));
-            if ($result === false) {
-                throw new Exception('获取失败,页面请求时出现错误');
-            }
-
-            $req = json_decode($result, true);
-            if (json_last_error() !== JSON_ERROR_NONE) {
-                throw new Exception('获取失败,JSON数据解析错误,请检查是否为shareapi');
-            }
-
-            if (!empty($req['status'])) {
-                $accounts = $req['accounts'] ?? [];
-                for ($i = 0; $i < sizeof($accounts); $i++) {
-                    $body = str_replace("{{apple_id$i}}", $accounts[$i]['username'] ?? '', $body);
-                    $body = str_replace("{{apple_pw$i}}", $accounts[$i]['password'] ?? '', $body);
-                    $body = str_replace(
-                        "{{apple_status$i}}",
-                        !empty($accounts[$i]['status']) ? '正常' : '异常',
-                        $body
-                    );
-                    $body = str_replace("{{apple_time$i}}", $accounts[$i]['last_check'] ?? '', $body);
+                if ($result === false || $httpCode < 200 || $httpCode >= 300) {
+                    $msg = $curlErr ?: ('HTTP ' . $httpCode);
+                    throw new Exception('shareapi 请求失败：' . $msg);
                 }
             } else {
-                $msg = $req['msg'] ?? '未知错误';
-                $body = str_replace('{{apple_id0}}', "获取失败,{$msg}", $body);
+                // 兜底：file_get_contents（加 UA，并启用跟随跳转）
+                $stream_opts = [
+                    'ssl' => [
+                        'verify_peer' => false,
+                        'verify_peer_name' => false,
+                    ],
+                    'http' => [
+                        'timeout' => 8,
+                        'follow_location' => 1,
+                        'ignore_errors' => true,
+                        'header' => [
+                            'Accept: application/json, text/plain, */*',
+                            'Content-Type: application/json',
+                            'User-Agent: CloudGap/1.0 (V2Board; AppleAutoPro)',
+                        ],
+                    ],
+                ];
+
+                $result = file_get_contents($this->share_url, false, stream_context_create($stream_opts));
+
+                // 读取 HTTP 状态码（php wrapper 会把状态行放在 $http_response_header[0]）
+                $statusLine = isset($http_response_header[0]) ? $http_response_header[0] : '';
+                if (!preg_match('/\s(\d{3})\s/', $statusLine, $m2)) {
+                    throw new Exception('shareapi 请求失败：无法解析状态码');
+                }
+                $httpCode = (int)$m2[1];
+
+                if ($result === false || $httpCode < 200 || $httpCode >= 300) {
+                    throw new Exception('shareapi 请求失败：' . $statusLine);
+                }
             }
+
+                        $req = json_decode($result, true);
+            if (!is_array($req)) {
+                throw new Exception('shareapi 返回不是有效 JSON');
+            }
+
+            // 兼容多种返回格式：
+            // 1) CloudGap/自建：{"code":200,"msg":"获取成功","accounts":[...],"status":true}
+            // 2) AppleAutoPro 旧格式：{"data":{"list":[...]}}
+            if (isset($req['accounts']) && is_array($req['accounts'])) {
+                $apple_ids = $req['accounts'];
+            } else if (isset($req['data']['list']) && is_array($req['data']['list'])) {
+                $apple_ids = $req['data']['list'];
+            } else if (isset($req['data']) && is_array($req['data'])) {
+                // 少数情况下 data 直接就是数组
+                $apple_ids = $req['data'];
+            } else {
+                throw new Exception('shareapi 返回结构不匹配：未找到 accounts 或 data.list');
+            }
+
+            // 替换占位符：{{apple_id0}} {{apple_pw0}} {{apple_status0}} {{apple_time0}} ...
+            foreach ($apple_ids as $k => $v) {
+                $index = (int)$k;
+
+                // 兼容字段命名
+                $id = $v['username'] ?? ($v['account'] ?? '');
+                $pw = $v['password'] ?? '';
+                // 状态优先用 message（如“正常/风控/需要验证”），否则根据布尔值推断
+                $statusText = $v['message'] ?? ($v['status'] ?? '');
+                if (is_bool($statusText)) {
+                    $statusText = $statusText ? '正常' : '异常';
+                } else if ($statusText === '' && isset($v['status']) && is_bool($v['status'])) {
+                    $statusText = $v['status'] ? '正常' : '异常';
+                }
+
+                $time = $v['last_check'] ?? ($v['updated_at'] ?? ($v['time'] ?? ''));
+
+                $body = str_replace('{{apple_id' . $index . '}}', (string)$id, $body);
+                $body = str_replace('{{apple_pw' . $index . '}}', (string)$pw, $body);
+                $body = str_replace('{{apple_status' . $index . '}}', (string)$statusText, $body);
+                $body = str_replace('{{apple_time' . $index . '}}', (string)$time, $body);
+            }
+
+            // 把没替换到的占位符清空（避免显示 {{apple_pw1}} 这种）
+            $clearPlaceholders();
+
         } catch (Exception $error) {
-            // 兼容原实现：只写入第一个占位符作为报错提示
+            // 显示错误在第一个账号位置，并清空剩余占位符
             $body = str_replace('{{apple_id0}}', $error->getMessage(), $body);
+            $clearPlaceholders();
         }
     }
 }
